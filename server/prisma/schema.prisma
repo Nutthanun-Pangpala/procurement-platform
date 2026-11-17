@@ -1,0 +1,898 @@
+// ============================================================================
+// Procurement Management Platform — schema.prisma (Step 0 revision)
+// PostgreSQL + Prisma. Baseline: Project Scope doc §6-§7.
+//
+// Conventions
+//  - Money: Decimal(18,2). Quantity: Decimal(18,4). All timestamps are UTC.
+//  - onDelete: Restrict for business records (default), Cascade only for pure
+//    child rows (items, revisions, links).
+//  - "CONFIG" = an Open Decision in the scope doc; isolated as configurable
+//    data instead of hard-coding a company policy.
+//  - "RAW-SQL" = constraint that Prisma cannot express; add in migration SQL
+//    (listed in docs/db-constraints.sql).
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────── ENUMS ───────────────────────────────────
+
+enum UserStatus {
+  ACTIVE
+  INVITED
+  DISABLED
+}
+
+enum RoleCode {
+  PM_REQUESTER
+  PROCUREMENT
+  VENDOR
+  APPROVER
+  ADMIN
+}
+
+enum VendorStatus {
+  PENDING
+  ACTIVE
+  REJECTED
+  SUSPENDED
+}
+
+enum RegistrationSource {
+  SELF_REGISTERED
+  INVITED
+}
+
+enum VendorUserRole {
+  OWNER
+  MEMBER
+}
+
+enum RegistrationRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum PRStatus {
+  DRAFT
+  SUBMITTED
+  UNDER_REVIEW
+  ACCEPTED
+  REVISION_REQUIRED
+  REJECTED
+  COMPLETED
+}
+
+enum RFQStatus {
+  DRAFT
+  PUBLISHED
+  OPEN
+  CLOSED
+  EVALUATING
+  AWARDED
+  CANCELLED
+}
+
+enum PricingModel {
+  TARGET_PRICE
+  FIXED_PRICE
+  REVERSE_AUCTION
+}
+
+enum TargetPriceVisibility {
+  HIDDEN
+  VISIBLE
+}
+
+enum TargetPriceScope {
+  PER_UNIT
+  PER_RFQ
+}
+
+enum ParticipationMode {
+  INVITATION_ONLY
+  OPEN
+}
+
+enum InvitationStatus {
+  INVITED
+  VIEWED
+  APPLIED
+  ACCEPTED
+  DECLINED
+  REJECTED
+}
+
+enum QuotationStatus {
+  DRAFT
+  SUBMITTED
+  REVISED
+  WITHDRAWN
+  DISQUALIFIED
+}
+
+enum ExceptionStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  REVISION_REQUIRED
+}
+
+enum ApprovalMethod {
+  PAPER_SIGNATURE
+  MANGO
+}
+
+enum AwardStatus {
+  PENDING_APPROVAL
+  APPROVED
+  SENT
+  ACCEPTED
+  DECLINED
+}
+
+enum DocumentType {
+  PR_ATTACHMENT
+  RFQ_ATTACHMENT
+  QUOTATION
+  VENDOR_DOCUMENT
+  APPROVAL_SIGNED
+  MANGO_EVIDENCE
+  AWARD
+  OTHER
+}
+
+enum DocumentEntityType {
+  PURCHASE_REQUEST
+  RFQ
+  QUOTATION
+  VENDOR
+  APPROVAL
+  AWARD
+}
+
+enum NotificationChannel {
+  IN_APP
+  EMAIL
+}
+
+enum NotificationStatus {
+  PENDING
+  SENT
+  FAILED
+  READ
+}
+
+// ───────────────────────────── IDENTITY ──────────────────────────────────
+
+model Department {
+  id    String @id @default(cuid())
+  name  String @unique
+  users User[]
+  prs   PurchaseRequest[]
+}
+
+model Role {
+  id    String     @id @default(cuid())
+  code  RoleCode   @unique
+  name  String
+  users UserRole[]
+}
+
+model User {
+  id           String     @id @default(cuid())
+  email        String     @unique
+  passwordHash String
+  fullName     String
+  status       UserStatus @default(ACTIVE)
+  departmentId String?
+  lastLoginAt  DateTime?
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  department Department? @relation(fields: [departmentId], references: [id])
+  roles      UserRole[]
+  vendorLinks VendorUser[]
+  refreshTokens RefreshToken[]
+
+  // back-relations (named)
+  prsRequested          PurchaseRequest[]       @relation("PRRequester")
+  prsReviewed           PurchaseRequest[]       @relation("PRReviewer")
+  prStatusChanges       PRStatusHistory[]
+  rfqsCreated           RFQ[]                   @relation("RFQCreator")
+  rfqStatusChanges      RFQStatusHistory[]
+  quotationsSubmitted   Quotation[]             @relation("QuotationSubmitter")
+  bidsPlaced            Bid[]                   @relation("BidPlacer")
+  evaluationRuns        EvaluationRun[]
+  exceptionsRequested   QuotationException[]    @relation("ExceptionRequester")
+  exceptionDecisions    ExceptionApproval[]
+  awardsSelected        Award[]                 @relation("AwardSelector")
+  approvalSteps         ApprovalStep[]
+  approvalEvents        ApprovalEvent[]
+  documentsUploaded     Document[]
+  vendorsApproved       Vendor[]                @relation("VendorApprover")
+  registrationsReviewed VendorRegistrationRequest[] @relation("RegistrationReviewer")
+  invitationsDecided    RFQInvitation[]         @relation("InvitationDecider")
+  auditLogs             AuditLog[]
+  notifications         Notification[]
+}
+
+model UserRole {
+  userId String
+  roleId String
+  user   User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role   Role @relation(fields: [roleId], references: [id])
+
+  @@id([userId, roleId])
+}
+
+model RefreshToken {
+  id        String    @id @default(cuid())
+  userId    String
+  tokenHash String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// ──────────────────────────────── VENDOR ─────────────────────────────────
+
+model Vendor {
+  id                 String             @id @default(cuid())
+  vendorCode         String?            @unique
+  companyName        String
+  taxId              String?            @unique
+  email              String
+  phone              String?
+  address            String?
+  status             VendorStatus       @default(PENDING)
+  registrationSource RegistrationSource
+  approvedAt         DateTime?
+  approvedById       String?
+  statusReason       String? // reject / suspend reason
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+
+  approvedBy   User?                       @relation("VendorApprover", fields: [approvedById], references: [id])
+  users        VendorUser[]
+  registrations VendorRegistrationRequest[]
+  documents    VendorDocument[]
+  invitations  RFQInvitation[]
+  quotations   Quotation[]
+  bids         Bid[]
+  evaluations  EvaluationResult[]
+  awards       Award[]
+
+  @@index([status])
+}
+
+model VendorUser {
+  id       String         @id @default(cuid())
+  vendorId String
+  userId   String
+  role     VendorUserRole @default(MEMBER)
+  vendor   Vendor         @relation(fields: [vendorId], references: [id])
+  user     User           @relation(fields: [userId], references: [id])
+
+  @@unique([vendorId, userId])
+  // A user belongs to at most one vendor (Vendor data isolation, simple model).
+  // CONFIG: drop this if a user may represent several vendors.
+  @@unique([userId])
+}
+
+model VendorRegistrationRequest {
+  id           String                    @id @default(cuid())
+  vendorId     String
+  source       RegistrationSource
+  status       RegistrationRequestStatus @default(PENDING)
+  submittedAt  DateTime                  @default(now())
+  reviewedById String?
+  reviewedAt   DateTime?
+  reviewNote   String?
+
+  vendor     Vendor @relation(fields: [vendorId], references: [id])
+  reviewedBy User?  @relation("RegistrationReviewer", fields: [reviewedById], references: [id])
+
+  @@index([status, submittedAt])
+}
+
+model VendorDocument {
+  id         String    @id @default(cuid())
+  vendorId   String
+  documentId String
+  docType    String // e.g. COMPANY_CERT, VAT_CERT, BANK_BOOK (free text, admin-defined)
+  expiresAt  DateTime?
+  vendor     Vendor    @relation(fields: [vendorId], references: [id])
+  document   Document  @relation(fields: [documentId], references: [id])
+
+  @@unique([vendorId, documentId])
+}
+
+// ────────────────────────── PURCHASE REQUEST ─────────────────────────────
+
+model PurchaseRequest {
+  id           String    @id @default(cuid())
+  prNumber     String    @unique
+  title        String
+  justification String?
+  requesterId  String
+  departmentId String?
+  status       PRStatus  @default(DRAFT)
+  requiredDate DateTime?
+  submittedAt  DateTime?
+  reviewedById String?
+  reviewedAt   DateTime?
+  reviewNote   String?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  requester  User        @relation("PRRequester", fields: [requesterId], references: [id])
+  reviewedBy User?       @relation("PRReviewer", fields: [reviewedById], references: [id])
+  department Department? @relation(fields: [departmentId], references: [id])
+  items      PRItem[]
+  history    PRStatusHistory[]
+  rfqs       RFQ[]
+  approvals  Approval[]
+
+  @@index([status, createdAt])
+  @@index([requesterId])
+}
+
+model PRItem {
+  id            String  @id @default(cuid())
+  prId          String
+  lineNo        Int
+  description   String
+  quantity      Decimal @db.Decimal(18, 4)
+  unit          String
+  specification String?
+  pr            PurchaseRequest @relation(fields: [prId], references: [id], onDelete: Cascade)
+
+  @@unique([prId, lineNo])
+}
+
+model PRStatusHistory {
+  id          String   @id @default(cuid())
+  prId        String
+  fromStatus  PRStatus?
+  toStatus    PRStatus
+  changedById String
+  note        String?
+  createdAt   DateTime @default(now())
+
+  pr        PurchaseRequest @relation(fields: [prId], references: [id])
+  changedBy User            @relation(fields: [changedById], references: [id])
+
+  @@index([prId, createdAt])
+}
+
+// ───────────────────────────────── RFQ ───────────────────────────────────
+
+model ProductCategory {
+  id          String  @id @default(cuid())
+  name        String  @unique
+  description String?
+  isActive    Boolean @default(true)
+
+  evaluationTemplates CategoryEvaluationTemplate[]
+  rfqs                RFQ[]
+}
+
+model RFQ {
+  id                 String            @id @default(cuid())
+  rfqNumber          String            @unique
+  prId               String
+  categoryId         String
+  createdById        String
+  title              String
+  pricingModel       PricingModel
+  participationMode  ParticipationMode
+  status             RFQStatus         @default(DRAFT)
+
+  // Target / fixed price
+  targetPrice           Decimal?              @db.Decimal(18, 2)
+  targetPriceVisibility TargetPriceVisibility @default(HIDDEN)
+  targetPriceScope      TargetPriceScope      @default(PER_RFQ) // CONFIG (open decision)
+  fixedPrice            Decimal?              @db.Decimal(18, 2)
+
+  // CONFIG (open decisions): kept per RFQ, never hard-coded
+  currency          String   @default("THB")
+  priceIncludesVat  Boolean  @default(false)
+  priceTerms        Json? // shipping / discount / other-cost rules
+  tieBreakRule      Json? // ordered list, e.g. ["TOTAL_SCORE","DELIVERY","FIRST_SUBMITTED"]
+  auctionConfig     Json? // startingPrice, floorPrice, minDecrement, antiSnipingSeconds, scope
+  minValidQuotations Int     @default(3) // from confirmed rule; value copied from SystemSetting
+
+  // Open-RFQ participation (CONFIG)
+  applyDeadline DateTime?
+  opensAt       DateTime
+  closesAt      DateTime
+  criteriaSnapshotAt DateTime? // set when criteria are snapshotted at open
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  pr          PurchaseRequest @relation(fields: [prId], references: [id])
+  category    ProductCategory @relation(fields: [categoryId], references: [id])
+  createdBy   User            @relation("RFQCreator", fields: [createdById], references: [id])
+  items       RFQItem[]
+  invitations RFQInvitation[]
+  criteria    RFQEvaluationCriterion[]
+  statusHistory RFQStatusHistory[]
+  quotations  Quotation[]
+  bids        Bid[]
+  evaluationRuns EvaluationRun[]
+  exceptions  QuotationException[]
+  award       Award?
+
+  @@index([status, opensAt, closesAt])
+  @@index([prId])
+  // RAW-SQL: CHECK (closesAt > opensAt)
+  // RAW-SQL: CHECK (pricingModel <> 'FIXED_PRICE'  OR fixedPrice IS NOT NULL)
+  // RAW-SQL: CHECK (pricingModel <> 'TARGET_PRICE' OR targetPrice IS NOT NULL OR true) -- target optional until confirmed
+}
+
+model RFQItem {
+  id            String  @id @default(cuid())
+  rfqId         String
+  prItemId      String?
+  lineNo        Int
+  description   String
+  quantity      Decimal @db.Decimal(18, 4)
+  unit          String
+  specification String?
+
+  rfq            RFQ             @relation(fields: [rfqId], references: [id], onDelete: Cascade)
+  quotationItems QuotationItem[]
+  bids           Bid[]
+
+  @@unique([rfqId, lineNo])
+}
+
+model RFQInvitation {
+  id          String           @id @default(cuid())
+  rfqId       String
+  vendorId    String
+  status      InvitationStatus @default(INVITED)
+  invitedAt   DateTime         @default(now())
+  viewedAt    DateTime?
+  appliedAt   DateTime?
+  decidedById String? // who accepted/rejected an OPEN-mode application (CONFIG: approver TBD)
+  decidedAt   DateTime?
+  decisionNote String?
+
+  rfq       RFQ    @relation(fields: [rfqId], references: [id])
+  vendor    Vendor @relation(fields: [vendorId], references: [id])
+  decidedBy User?  @relation("InvitationDecider", fields: [decidedById], references: [id])
+
+  @@unique([rfqId, vendorId])
+  @@index([vendorId, status])
+}
+
+model RFQStatusHistory {
+  id          String    @id @default(cuid())
+  rfqId       String
+  fromStatus  RFQStatus?
+  toStatus    RFQStatus
+  changedById String
+  note        String?
+  createdAt   DateTime  @default(now())
+
+  rfq       RFQ  @relation(fields: [rfqId], references: [id])
+  changedBy User @relation(fields: [changedById], references: [id])
+
+  @@index([rfqId, createdAt])
+}
+
+// ──────────────────────── COMMERCIAL (QUOTE / BID) ───────────────────────
+
+// One Quotation row per (RFQ, Vendor). Edits bump `revision`; every submitted
+// state is frozen in QuotationRevision (replaces the baseline's row-per-revision).
+model Quotation {
+  id                String          @id @default(cuid())
+  rfqId             String
+  vendorId          String
+  submittedById     String?
+  quotationNumber   String          @unique
+  status            QuotationStatus @default(DRAFT)
+  revision          Int             @default(1)
+  currency          String          @default("THB")
+  subtotal          Decimal         @default(0) @db.Decimal(18, 2)
+  discountTotal     Decimal         @default(0) @db.Decimal(18, 2)
+  shippingCost      Decimal         @default(0) @db.Decimal(18, 2)
+  taxTotal          Decimal         @default(0) @db.Decimal(18, 2)
+  totalAmount       Decimal         @db.Decimal(18, 2) // computed on backend only
+  deliveryDays      Int?
+  validUntil        DateTime?
+  note              String?
+  isCompliant       Boolean? // mandatory-qualification result (backend)
+  disqualifiedReason String?
+  firstSubmittedAt  DateTime? // server time; replaces manual Excel "queue"
+  submittedAt       DateTime? // latest submit/revise, server time
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+
+  rfq         RFQ                @relation(fields: [rfqId], references: [id])
+  vendor      Vendor             @relation(fields: [vendorId], references: [id])
+  submittedBy User?              @relation("QuotationSubmitter", fields: [submittedById], references: [id])
+  items       QuotationItem[]
+  revisions   QuotationRevision[]
+  awards      Award[]
+
+  @@unique([rfqId, vendorId])
+  @@index([rfqId, status])
+}
+
+model QuotationItem {
+  id          String  @id @default(cuid())
+  quotationId String
+  rfqItemId   String
+  unitPrice   Decimal @db.Decimal(18, 2)
+  discount    Decimal @default(0) @db.Decimal(18, 2)
+  tax         Decimal? @db.Decimal(18, 2)
+  lineTotal   Decimal @db.Decimal(18, 2) // computed on backend only
+  note        String?
+
+  quotation Quotation @relation(fields: [quotationId], references: [id], onDelete: Cascade)
+  rfqItem   RFQItem   @relation(fields: [rfqItemId], references: [id])
+
+  @@unique([quotationId, rfqItemId])
+}
+
+model QuotationRevision {
+  id          String   @id @default(cuid())
+  quotationId String
+  revision    Int
+  snapshot    Json
+  createdAt   DateTime @default(now())
+
+  quotation Quotation @relation(fields: [quotationId], references: [id], onDelete: Cascade)
+
+  @@unique([quotationId, revision])
+}
+
+// APPEND-ONLY. Service layer exposes no update/delete; RAW-SQL trigger blocks them.
+model Bid {
+  id            String   @id @default(cuid())
+  rfqId         String
+  vendorId      String
+  placedById    String
+  rfqItemId     String? // null = whole-RFQ bid (CONFIG: per-item auction undecided)
+  bidAmount     Decimal  @db.Decimal(18, 2)
+  bidNumber     Int // per (rfq, vendor) sequence, assigned in a transaction
+  submittedAt   DateTime @default(now()) // server timestamp only
+
+  rfq      RFQ      @relation(fields: [rfqId], references: [id])
+  vendor   Vendor   @relation(fields: [vendorId], references: [id])
+  placedBy User     @relation("BidPlacer", fields: [placedById], references: [id])
+  rfqItem  RFQItem? @relation(fields: [rfqItemId], references: [id])
+
+  @@unique([rfqId, vendorId, bidNumber])
+  @@index([rfqId, submittedAt])
+  @@index([rfqId, bidAmount])
+}
+
+// ───────────────────────── EVALUATION & RANKING ──────────────────────────
+
+model EvaluationCriterion {
+  id          String  @id @default(cuid())
+  code        String  @unique // PRICE, DELIVERY, QUALITY, VENDOR_PERFORMANCE, ...
+  name        String
+  description String?
+  isActive    Boolean @default(true)
+
+  templateLinks CategoryTemplateCriterion[]
+  rfqCriteria   RFQEvaluationCriterion[]
+}
+
+model CategoryEvaluationTemplate {
+  id         String   @id @default(cuid())
+  categoryId String
+  name       String
+  version    Int      @default(1)
+  isActive   Boolean  @default(true)
+  createdAt  DateTime @default(now())
+
+  category  ProductCategory            @relation(fields: [categoryId], references: [id])
+  criteria  CategoryTemplateCriterion[]
+
+  @@unique([categoryId, version])
+}
+
+model CategoryTemplateCriterion {
+  id          String  @id @default(cuid())
+  templateId  String
+  criterionId String
+  weight      Decimal @db.Decimal(6, 3) // company-defined; sum validated in service
+  isMandatory Boolean @default(false) // mandatory qualification (pass/fail)
+  config      Json?
+
+  template  CategoryEvaluationTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  criterion EvaluationCriterion        @relation(fields: [criterionId], references: [id])
+
+  @@unique([templateId, criterionId])
+}
+
+// Frozen copy taken when RFQ opens → criteria can never change retroactively.
+model RFQEvaluationCriterion {
+  id          String  @id @default(cuid())
+  rfqId       String
+  criterionId String?
+  code        String
+  name        String
+  weight      Decimal @db.Decimal(6, 3)
+  isMandatory Boolean @default(false)
+  config      Json?
+
+  rfq       RFQ                  @relation(fields: [rfqId], references: [id], onDelete: Cascade)
+  criterion EvaluationCriterion? @relation(fields: [criterionId], references: [id])
+
+  @@unique([rfqId, code])
+}
+
+// Each (re)evaluation is a run; results are immutable snapshots of that run.
+model EvaluationRun {
+  id            String   @id @default(cuid())
+  rfqId         String
+  runNumber     Int
+  triggeredById String
+  inputSnapshot Json? // criteria + quotation/bid versions used
+  createdAt     DateTime @default(now())
+
+  rfq         RFQ                @relation(fields: [rfqId], references: [id])
+  triggeredBy User               @relation(fields: [triggeredById], references: [id])
+  results     EvaluationResult[]
+  awards      Award[]
+
+  @@unique([rfqId, runNumber])
+}
+
+model EvaluationResult {
+  id                  String   @id @default(cuid())
+  runId               String
+  vendorId            String
+  qualified           Boolean  @default(true)
+  disqualifiedReason  String?
+  normalizedPrice     Decimal? @db.Decimal(18, 2)
+  priceScore          Decimal? @db.Decimal(8, 3)
+  deliveryScore       Decimal? @db.Decimal(8, 3)
+  qualityScore        Decimal? @db.Decimal(8, 3)
+  performanceScore    Decimal? @db.Decimal(8, 3)
+  totalScore          Decimal  @db.Decimal(8, 3)
+  rank                Int?     // null when not qualified
+  priceFlag           String?  // e.g. OVER_BUDGET, BELOW_FLOOR, NO_QUALIFIED_BID
+  snapshot            Json
+  createdAt           DateTime @default(now())
+
+  run    EvaluationRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+  vendor Vendor        @relation(fields: [vendorId], references: [id])
+
+  @@unique([runId, vendorId])
+  @@index([runId, rank])
+}
+
+// ──────────────────────── EXCEPTION (< 3 QUOTES) ─────────────────────────
+
+model QuotationException {
+  id                  String          @id @default(cuid())
+  rfqId               String
+  requestedById       String
+  reason              String
+  validQuotationCount Int
+  status              ExceptionStatus @default(PENDING)
+  decidedAt           DateTime?
+  createdAt           DateTime        @default(now())
+
+  rfq         RFQ                 @relation(fields: [rfqId], references: [id])
+  requestedBy User                @relation("ExceptionRequester", fields: [requestedById], references: [id])
+  approvals   ExceptionApproval[]
+
+  @@index([rfqId, status])
+}
+
+// One row per approver decision (approver set / thresholds are CONFIG).
+model ExceptionApproval {
+  id          String          @id @default(cuid())
+  exceptionId String
+  approverId  String
+  decision    ExceptionStatus // PENDING | APPROVED | REJECTED
+  reason      String?
+  decidedAt   DateTime?
+  createdAt   DateTime        @default(now())
+
+  exception QuotationException @relation(fields: [exceptionId], references: [id], onDelete: Cascade)
+  approver  User               @relation(fields: [approverId], references: [id])
+
+  @@unique([exceptionId, approverId])
+}
+
+// ─────────────────────────────── AWARD ───────────────────────────────────
+
+model Award {
+  id               String      @id @default(cuid())
+  rfqId            String      @unique
+  vendorId         String
+  quotationId      String?
+  evaluationRunId  String
+  selectedById     String
+  rankAtSelection  Int
+  selectionReason  String? // required when rankAtSelection <> 1 (RAW-SQL CHECK)
+  awardedAmount    Decimal?    @db.Decimal(18, 2)
+  status           AwardStatus @default(PENDING_APPROVAL)
+  selectedAt       DateTime    @default(now())
+
+  rfq           RFQ           @relation(fields: [rfqId], references: [id])
+  vendor        Vendor        @relation(fields: [vendorId], references: [id])
+  quotation     Quotation?    @relation(fields: [quotationId], references: [id])
+  evaluationRun EvaluationRun @relation(fields: [evaluationRunId], references: [id])
+  selectedBy    User          @relation("AwardSelector", fields: [selectedById], references: [id])
+  approval      Approval?
+}
+
+// ───────────────────────────── APPROVAL ──────────────────────────────────
+
+// CONFIG (open decision): baseline ERD links Approval → PR. Award link is
+// optional so a flow can be attached to the Award/RFQ without a schema change.
+model Approval {
+  id        String         @id @default(cuid())
+  prId      String
+  awardId   String?        @unique
+  status    ApprovalStatus @default(PENDING)
+  createdAt DateTime       @default(now())
+  completedAt DateTime?
+
+  pr        PurchaseRequest @relation(fields: [prId], references: [id])
+  award     Award?          @relation(fields: [awardId], references: [id])
+  steps     ApprovalStep[]
+  events    ApprovalEvent[]
+  documents ApprovalDocument[]
+
+  @@index([prId])
+}
+
+// Step 1 = PAPER_SIGNATURE (Owner 1), step 2 = MANGO (Owner 2) by default;
+// sequence / amount thresholds are CONFIG.
+model ApprovalStep {
+  id            String         @id @default(cuid())
+  approvalId    String
+  stepOrder     Int
+  method        ApprovalMethod
+  approverId    String?
+  status        ApprovalStatus @default(PENDING)
+  decidedAt     DateTime?
+  decisionNote  String?
+  externalRef   String? // Mango reference / document no.
+
+  approval Approval @relation(fields: [approvalId], references: [id], onDelete: Cascade)
+  approver User?    @relation(fields: [approverId], references: [id])
+  events   ApprovalEvent[]
+
+  @@unique([approvalId, stepOrder])
+}
+
+model ApprovalEvent {
+  id         String   @id @default(cuid())
+  approvalId String
+  stepId     String?
+  action     String
+  actorId    String
+  note       String?
+  createdAt  DateTime @default(now())
+
+  approval Approval      @relation(fields: [approvalId], references: [id])
+  step     ApprovalStep? @relation(fields: [stepId], references: [id])
+  actor    User          @relation(fields: [actorId], references: [id])
+
+  @@index([approvalId, createdAt])
+}
+
+model ApprovalDocument {
+  id         String   @id @default(cuid())
+  approvalId String
+  documentId String
+  approval   Approval @relation(fields: [approvalId], references: [id])
+  document   Document @relation(fields: [documentId], references: [id])
+
+  @@unique([approvalId, documentId])
+}
+
+// ──────────────────────────── DOCUMENTS ──────────────────────────────────
+
+model Document {
+  id           String       @id @default(cuid())
+  fileName     String
+  storageKey   String       @unique
+  mimeType     String
+  sizeBytes    BigInt
+  checksum     String?
+  documentType DocumentType
+  version      Int          @default(1)
+  uploadedById String
+  createdAt    DateTime     @default(now())
+
+  uploadedBy    User               @relation(fields: [uploadedById], references: [id])
+  links         DocumentLink[]
+  approvalLinks ApprovalDocument[]
+  vendorDocs    VendorDocument[]
+}
+
+// Generic link: document ↔ PR / RFQ / Quotation / Vendor / Approval / Award.
+model DocumentLink {
+  id         String             @id @default(cuid())
+  documentId String
+  entityType DocumentEntityType
+  entityId   String
+  createdAt  DateTime           @default(now())
+
+  document Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@unique([documentId, entityType, entityId])
+  @@index([entityType, entityId])
+}
+
+// ─────────────────────────── PLATFORM ────────────────────────────────────
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  userId     String?
+  action     String
+  entityType String
+  entityId   String
+  metadata   Json? // before/after, reason, ip, etc.
+  createdAt  DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id])
+
+  @@index([entityType, entityId, createdAt])
+  @@index([userId, createdAt])
+}
+
+model Notification {
+  id        String              @id @default(cuid())
+  userId    String
+  type      String
+  channel   NotificationChannel
+  status    NotificationStatus  @default(PENDING)
+  payload   Json?
+  sentAt    DateTime?
+  readAt    DateTime?
+  createdAt DateTime            @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId, status, createdAt])
+}
+
+// Per-year running numbers for prNumber / rfqNumber / quotationNumber.
+model NumberSequence {
+  key   String // e.g. "PR", "RFQ", "QT"
+  year  Int
+  value Int    @default(0)
+
+  @@id([key, year])
+}
+
+// Home for CONFIG values (open decisions) so no company policy is hard-coded.
+// e.g. "procurement.min_valid_quotations" = 3, "pr.submit_days" = {...},
+//      "timezone" = "Asia/Bangkok", "exception.approver_roles" = [...]
+model SystemSetting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt
+}
