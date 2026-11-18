@@ -1,0 +1,374 @@
+diff --git a/server/src/auth/auth.controller.ts b/server/src/auth/auth.controller.ts
+index 8a147d4..07eefd4 100644
+--- a/server/src/auth/auth.controller.ts
++++ b/server/src/auth/auth.controller.ts
+@@ -7,14 +7,14 @@ import {
+   Req,
+   Res,
+   UnauthorizedException,
+-  UseGuards,
+ } from '@nestjs/common';
+ import type { Request, Response } from 'express';
+ import { AuthService } from './auth.service.js';
+ import { LoginDto } from './dto/login.dto.js';
+-import { JwtAuthGuard } from './jwt-auth.guard.js';
++import { Auth } from './auth.decorator.js';
++import { CurrentUser } from './current-user.js';
+ import { readCookie } from './cookies.js';
+-import type { AuthenticatedRequest } from './auth.types.js';
++import type { JwtPayload } from './auth.types.js';
+ 
+ const REFRESH_COOKIE = 'refresh_token';
+ // Only sent to /auth/* so the refresh token never travels with other requests.
+@@ -66,10 +66,10 @@ export class AuthController {
+     res.clearCookie(REFRESH_COOKIE, { path: COOKIE_PATH });
+   }
+ 
+-  @UseGuards(JwtAuthGuard)
++  @Auth()
+   @Get('me')
+-  me(@Req() req: AuthenticatedRequest) {
+-    return this.auth.me(req.user.sub);
++  me(@CurrentUser() user: JwtPayload) {
++    return this.auth.me(user.sub);
+   }
+ 
+   private setRefreshCookie(res: Response, token: string, expires: Date) {
+diff --git a/server/src/auth/auth.decorator.ts b/server/src/auth/auth.decorator.ts
+new file mode 100644
+index 0000000..ee49cdd
+--- /dev/null
++++ b/server/src/auth/auth.decorator.ts
+@@ -0,0 +1,18 @@
++import { applyDecorators, SetMetadata, UseGuards } from '@nestjs/common';
++import type { RoleCode } from '@prisma/client';
++import { JwtAuthGuard } from './jwt-auth.guard.js';
++import { ROLES_KEY } from './roles.constants.js';
++import { RolesGuard } from './roles.guard.js';
++
++/**
++ * Protects a route or controller.
++ *   @Auth()                          any logged-in user
++ *   @Auth('PROCUREMENT')             PROCUREMENT only
++ *   @Auth('PROCUREMENT', 'APPROVER') either role
++ * The module that uses it must import AuthModule (it provides JwtService).
++ */
++export const Auth = (...roles: RoleCode[]) =>
++  applyDecorators(
++    SetMetadata(ROLES_KEY, roles),
++    UseGuards(JwtAuthGuard, RolesGuard),
++  );
+diff --git a/server/src/auth/auth.module.ts b/server/src/auth/auth.module.ts
+index 1fe3825..a06980f 100644
+--- a/server/src/auth/auth.module.ts
++++ b/server/src/auth/auth.module.ts
+@@ -4,6 +4,7 @@ import { JwtModule } from '@nestjs/jwt';
+ import { AuthController } from './auth.controller.js';
+ import { AuthService } from './auth.service.js';
+ import { JwtAuthGuard } from './jwt-auth.guard.js';
++import { RolesGuard } from './roles.guard.js';
+ 
+ @Module({
+   imports: [
+@@ -24,7 +25,7 @@ import { JwtAuthGuard } from './jwt-auth.guard.js';
+     }),
+   ],
+   controllers: [AuthController],
+-  providers: [AuthService, JwtAuthGuard],
+-  exports: [JwtModule, JwtAuthGuard],
++  providers: [AuthService, JwtAuthGuard, RolesGuard],
++  exports: [JwtModule, JwtAuthGuard, RolesGuard],
+ })
+ export class AuthModule {}
+diff --git a/server/src/auth/current-user.ts b/server/src/auth/current-user.ts
+new file mode 100644
+index 0000000..6e24096
+--- /dev/null
++++ b/server/src/auth/current-user.ts
+@@ -0,0 +1,22 @@
++import {
++  createParamDecorator,
++  ExecutionContext,
++  ForbiddenException,
++} from '@nestjs/common';
++import type { AuthenticatedRequest, JwtPayload } from './auth.types.js';
++
++/** The caller as stored in the token. Use this, never ids from the request body. */
++export const CurrentUser = createParamDecorator(
++  (_data: unknown, context: ExecutionContext): JwtPayload =>
++    context.switchToHttp().getRequest<AuthenticatedRequest>().user,
++);
++
++export function hasAnyRole(user: JwtPayload, ...roles: string[]): boolean {
++  return roles.some((role) => user.roles.includes(role));
++}
++
++/** For Vendor-only routes: the vendor always comes from the token. */
++export function requireVendorId(user: JwtPayload): string {
++  if (!user.vendorId) throw new ForbiddenException('Vendor account required');
++  return user.vendorId;
++}
+diff --git a/server/src/auth/roles.constants.ts b/server/src/auth/roles.constants.ts
+new file mode 100644
+index 0000000..d7237ec
+--- /dev/null
++++ b/server/src/auth/roles.constants.ts
+@@ -0,0 +1 @@
++export const ROLES_KEY = 'roles';
+diff --git a/server/src/auth/roles.guard.spec.ts b/server/src/auth/roles.guard.spec.ts
+new file mode 100644
+index 0000000..db59e62
+--- /dev/null
++++ b/server/src/auth/roles.guard.spec.ts
+@@ -0,0 +1,64 @@
++import {
++  ExecutionContext,
++  ForbiddenException,
++  UnauthorizedException,
++} from '@nestjs/common';
++import { Reflector } from '@nestjs/core';
++import { RolesGuard } from './roles.guard.js';
++
++function ctx(user: unknown): ExecutionContext {
++  return {
++    getHandler: () => () => undefined,
++    getClass: () => class {},
++    switchToHttp: () => ({ getRequest: () => ({ user }) }),
++  } as unknown as ExecutionContext;
++}
++
++function guardRequiring(roles: string[] | undefined) {
++  const reflector = {
++    getAllAndOverride: vi.fn().mockReturnValue(roles),
++  } as unknown as Reflector;
++  return new RolesGuard(reflector);
++}
++
++const user = (...roles: string[]) => ({ sub: 'u1', roles, vendorId: null });
++
++describe('RolesGuard', () => {
++  it('allows any logged-in user when no roles are required', () => {
++    expect(guardRequiring(undefined).canActivate(ctx(user()))).toBe(true);
++    expect(guardRequiring([]).canActivate(ctx(user('VENDOR')))).toBe(true);
++  });
++
++  it('allows a user holding one of the required roles', () => {
++    const guard = guardRequiring(['PROCUREMENT', 'APPROVER']);
++    expect(guard.canActivate(ctx(user('APPROVER')))).toBe(true);
++  });
++
++  it('allows a user with several roles when one matches', () => {
++    const guard = guardRequiring(['PROCUREMENT']);
++    expect(guard.canActivate(ctx(user('PM_REQUESTER', 'PROCUREMENT')))).toBe(
++      true,
++    );
++  });
++
++  it('forbids a user without any required role', () => {
++    const guard = guardRequiring(['PROCUREMENT']);
++    expect(() => guard.canActivate(ctx(user('VENDOR')))).toThrow(
++      ForbiddenException,
++    );
++  });
++
++  it('does not treat ADMIN as a superuser', () => {
++    const guard = guardRequiring(['PROCUREMENT']);
++    expect(() => guard.canActivate(ctx(user('ADMIN')))).toThrow(
++      ForbiddenException,
++    );
++  });
++
++  it('is unauthorized when no user is on the request', () => {
++    const guard = guardRequiring(['ADMIN']);
++    expect(() => guard.canActivate(ctx(undefined))).toThrow(
++      UnauthorizedException,
++    );
++  });
++});
+diff --git a/server/src/auth/roles.guard.ts b/server/src/auth/roles.guard.ts
+new file mode 100644
+index 0000000..2cff45e
+--- /dev/null
++++ b/server/src/auth/roles.guard.ts
+@@ -0,0 +1,37 @@
++import {
++  CanActivate,
++  ExecutionContext,
++  ForbiddenException,
++  Injectable,
++  UnauthorizedException,
++} from '@nestjs/common';
++import { Reflector } from '@nestjs/core';
++import type { RoleCode } from '@prisma/client';
++import type { AuthenticatedRequest } from './auth.types.js';
++import { ROLES_KEY } from './roles.constants.js';
++
++/**
++ * Allows the request when the user has at least one of the roles listed by
++ * @Auth(...). No role is a superuser: ADMIN only passes where ADMIN is listed.
++ * Must run after JwtAuthGuard (use @Auth(), which wires both in order).
++ */
++@Injectable()
++export class RolesGuard implements CanActivate {
++  constructor(private readonly reflector: Reflector) {}
++
++  canActivate(context: ExecutionContext): boolean {
++    const required = this.reflector.getAllAndOverride<RoleCode[] | undefined>(
++      ROLES_KEY,
++      [context.getHandler(), context.getClass()],
++    );
++    if (!required || required.length === 0) return true;
++
++    const user = context.switchToHttp().getRequest<AuthenticatedRequest>().user;
++    if (!user) throw new UnauthorizedException();
++
++    if (!required.some((role) => user.roles.includes(role))) {
++      throw new ForbiddenException('You do not have permission to do this');
++    }
++    return true;
++  }
++}
+diff --git a/server/test/rbac.e2e-spec.ts b/server/test/rbac.e2e-spec.ts
+new file mode 100644
+index 0000000..7bf3af2
+--- /dev/null
++++ b/server/test/rbac.e2e-spec.ts
+@@ -0,0 +1,138 @@
++import {
++  Controller,
++  Get,
++  INestApplication,
++  Module,
++  Query,
++} from '@nestjs/common';
++import { JwtService } from '@nestjs/jwt';
++import { Test } from '@nestjs/testing';
++import request from 'supertest';
++import { App } from 'supertest/types';
++import { AppModule } from './../src/app.module.js';
++import { configureApp } from './../src/app.setup.js';
++import { Auth } from './../src/auth/auth.decorator.js';
++import type { JwtPayload } from './../src/auth/auth.types.js';
++import { AuthModule } from './../src/auth/auth.module.js';
++import { CurrentUser, requireVendorId } from './../src/auth/current-user.js';
++import { PrismaService } from './../src/prisma/prisma.service.js';
++
++// Throwaway routes that exist only in this test, to exercise the guards.
++@Controller('rbac-test')
++class RbacTestController {
++  @Auth()
++  @Get('any')
++  any() {
++    return { ok: true };
++  }
++
++  @Auth('ADMIN')
++  @Get('admin')
++  admin() {
++    return { ok: true };
++  }
++
++  @Auth('PROCUREMENT', 'APPROVER')
++  @Get('either')
++  either() {
++    return { ok: true };
++  }
++
++  @Auth('VENDOR')
++  @Get('vendor-scope')
++  vendorScope(
++    @CurrentUser() user: JwtPayload,
++    @Query('vendorId') _ignored?: string,
++  ) {
++    return { vendorId: requireVendorId(user) };
++  }
++}
++
++@Module({ imports: [AuthModule], controllers: [RbacTestController] })
++class RbacTestModule {}
++
++describe('RBAC (e2e)', () => {
++  let app: INestApplication<App>;
++  let jwt: JwtService;
++  const http = () => request(app.getHttpServer());
++  const token = (roles: string[], vendorId: string | null = null) =>
++    jwt.signAsync({ sub: 'u1', roles, vendorId } satisfies JwtPayload);
++  // Sends the request and returns the response (status + body).
++  const call = async (
++    path: string,
++    roles?: string[],
++    vendorId: string | null = null,
++  ) => {
++    const req = http().get(`/api/v1/rbac-test/${path}`);
++    if (roles) {
++      req.set('Authorization', `Bearer ${await token(roles, vendorId)}`);
++    }
++    return req;
++  };
++
++  beforeAll(async () => {
++    process.env.JWT_SECRET = 'e2e-secret-e2e-secret-e2e-secret-1234';
++    const moduleRef = await Test.createTestingModule({
++      imports: [AppModule, RbacTestModule],
++    })
++      .overrideProvider(PrismaService)
++      .useValue({
++        $connect: async () => undefined,
++        $disconnect: async () => undefined,
++      })
++      .compile();
++    app = moduleRef.createNestApplication();
++    configureApp(app);
++    await app.init();
++    jwt = app.get(JwtService, { strict: false });
++  });
++
++  afterAll(async () => {
++    await app.close();
++  });
++
++  it('401 without a token, on every protected route', async () => {
++    expect((await call('any')).status).toBe(401);
++    expect((await call('admin')).status).toBe(401);
++    expect((await call('either')).status).toBe(401);
++  });
++
++  it('@Auth() lets any logged-in role in', async () => {
++    expect((await call('any', ['VENDOR'])).status).toBe(200);
++  });
++
++  it('403 for the wrong role, 200 for the right one', async () => {
++    expect((await call('admin', ['PM_REQUESTER'])).status).toBe(403);
++    expect((await call('admin', ['ADMIN'])).status).toBe(200);
++  });
++
++  it('accepts any one of several allowed roles', async () => {
++    expect((await call('either', ['APPROVER'])).status).toBe(200);
++    expect((await call('either', ['PROCUREMENT'])).status).toBe(200);
++    expect((await call('either', ['VENDOR'])).status).toBe(403);
++  });
++
++  it('ADMIN is not a superuser', async () => {
++    expect((await call('either', ['ADMIN'])).status).toBe(403);
++  });
++
++  it('a user with several roles passes if any one matches', async () => {
++    expect((await call('either', ['PM_REQUESTER', 'APPROVER'])).status).toBe(
++      200,
++    );
++  });
++
++  it('vendor routes use the vendorId from the token, not the query', async () => {
++    const res = await call(
++      'vendor-scope?vendorId=someone-else',
++      ['VENDOR'],
++      'v1',
++    );
++    expect(res.status).toBe(200);
++    expect(res.body).toEqual({ vendorId: 'v1' });
++  });
++
++  it('a VENDOR token with no vendor linked is 403', async () => {
++    expect((await call('vendor-scope', ['VENDOR'], null)).status).toBe(403);
++  });
++});

@@ -1,0 +1,520 @@
+diff --git a/server/.env.example b/server/.env.example
+index 0928693..bb60e75 100644
+--- a/server/.env.example
++++ b/server/.env.example
+@@ -2,3 +2,5 @@
+ DATABASE_URL="postgresql://procurement:procurement@localhost:5434/procurement"
+ PORT=3001
+ CLIENT_ORIGIN="http://localhost:3000"
++JWT_SECRET="change-me-to-a-random-string-of-at-least-32-characters"
++JWT_EXPIRES_IN_SECONDS=900
+diff --git a/server/src/app.module.ts b/server/src/app.module.ts
+index 53b32ff..67001ed 100644
+--- a/server/src/app.module.ts
++++ b/server/src/app.module.ts
+@@ -1,10 +1,11 @@
+ import { Module } from '@nestjs/common';
+ import { ConfigModule } from '@nestjs/config';
+ import { AppController } from './app.controller.js';
++import { AuthModule } from './auth/auth.module.js';
+ import { PrismaModule } from './prisma/prisma.module.js';
+ 
+ @Module({
+-  imports: [ConfigModule.forRoot({ isGlobal: true }), PrismaModule],
++  imports: [ConfigModule.forRoot({ isGlobal: true }), PrismaModule, AuthModule],
+   controllers: [AppController],
+ })
+ export class AppModule {}
+diff --git a/server/src/app.setup.ts b/server/src/app.setup.ts
+new file mode 100644
+index 0000000..d55e37d
+--- /dev/null
++++ b/server/src/app.setup.ts
+@@ -0,0 +1,17 @@
++import { INestApplication, ValidationPipe } from '@nestjs/common';
++
++/** Shared by main.ts and e2e tests so both run with the same HTTP settings. */
++export function configureApp(app: INestApplication) {
++  app.setGlobalPrefix('api/v1');
++  app.useGlobalPipes(
++    new ValidationPipe({
++      whitelist: true,
++      forbidNonWhitelisted: true,
++      transform: true,
++    }),
++  );
++  app.enableCors({
++    origin: process.env.CLIENT_ORIGIN ?? 'http://localhost:3000',
++    credentials: true,
++  });
++}
+diff --git a/server/src/auth/auth.controller.ts b/server/src/auth/auth.controller.ts
+new file mode 100644
+index 0000000..601b1c5
+--- /dev/null
++++ b/server/src/auth/auth.controller.ts
+@@ -0,0 +1,30 @@
++import {
++  Body,
++  Controller,
++  Get,
++  HttpCode,
++  Post,
++  Req,
++  UseGuards,
++} from '@nestjs/common';
++import { AuthService } from './auth.service.js';
++import { LoginDto } from './dto/login.dto.js';
++import { JwtAuthGuard } from './jwt-auth.guard.js';
++import type { AuthenticatedRequest } from './auth.types.js';
++
++@Controller('auth')
++export class AuthController {
++  constructor(private readonly auth: AuthService) {}
++
++  @Post('login')
++  @HttpCode(200)
++  login(@Body() dto: LoginDto) {
++    return this.auth.login(dto.email, dto.password);
++  }
++
++  @UseGuards(JwtAuthGuard)
++  @Get('me')
++  me(@Req() req: AuthenticatedRequest) {
++    return this.auth.me(req.user.sub);
++  }
++}
+diff --git a/server/src/auth/auth.module.ts b/server/src/auth/auth.module.ts
+new file mode 100644
+index 0000000..1fe3825
+--- /dev/null
++++ b/server/src/auth/auth.module.ts
+@@ -0,0 +1,30 @@
++import { Module } from '@nestjs/common';
++import { ConfigService } from '@nestjs/config';
++import { JwtModule } from '@nestjs/jwt';
++import { AuthController } from './auth.controller.js';
++import { AuthService } from './auth.service.js';
++import { JwtAuthGuard } from './jwt-auth.guard.js';
++
++@Module({
++  imports: [
++    JwtModule.registerAsync({
++      inject: [ConfigService],
++      useFactory: (config: ConfigService) => {
++        const secret = config.get<string>('JWT_SECRET');
++        if (!secret || secret.length < 32) {
++          throw new Error('JWT_SECRET must be set and at least 32 characters');
++        }
++        return {
++          secret,
++          signOptions: {
++            expiresIn: Number(config.get('JWT_EXPIRES_IN_SECONDS') ?? 900),
++          },
++        };
++      },
++    }),
++  ],
++  controllers: [AuthController],
++  providers: [AuthService, JwtAuthGuard],
++  exports: [JwtModule, JwtAuthGuard],
++})
++export class AuthModule {}
+diff --git a/server/src/auth/auth.service.spec.ts b/server/src/auth/auth.service.spec.ts
+new file mode 100644
+index 0000000..f63a20b
+--- /dev/null
++++ b/server/src/auth/auth.service.spec.ts
+@@ -0,0 +1,85 @@
++import { UnauthorizedException } from '@nestjs/common';
++import { JwtService } from '@nestjs/jwt';
++import bcrypt from 'bcryptjs';
++import { AuthService } from './auth.service.js';
++
++const PASSWORD = 'Correct-Horse-1';
++const baseUser = {
++  id: 'u1',
++  email: 'admin@example.com',
++  fullName: 'Admin',
++  passwordHash: bcrypt.hashSync(PASSWORD, 4),
++  status: 'ACTIVE',
++  roles: [{ role: { code: 'ADMIN' } }],
++  vendorLinks: [],
++};
++
++function build(user: unknown) {
++  const prisma = {
++    user: {
++      findFirst: vi.fn().mockResolvedValue(user),
++      findUnique: vi.fn().mockResolvedValue(user),
++      update: vi.fn().mockResolvedValue({}),
++    },
++  };
++  const jwt = { signAsync: vi.fn().mockResolvedValue('signed-token') };
++  const service = new AuthService(
++    prisma as never,
++    jwt as unknown as JwtService,
++  );
++  return { service, prisma, jwt };
++}
++
++describe('AuthService', () => {
++  it('logs in with a valid password and puts roles in the token', async () => {
++    const { service, jwt, prisma } = build(baseUser);
++    const res = await service.login('ADMIN@example.com', PASSWORD);
++
++    expect(res.accessToken).toBe('signed-token');
++    expect(res.user.roles).toEqual(['ADMIN']);
++    expect(jwt.signAsync).toHaveBeenCalledWith({
++      sub: 'u1',
++      roles: ['ADMIN'],
++      vendorId: null,
++    });
++    expect(prisma.user.update).toHaveBeenCalled();
++  });
++
++  it('puts the vendorId from the vendor link in the token', async () => {
++    const { service, jwt } = build({
++      ...baseUser,
++      roles: [{ role: { code: 'VENDOR' } }],
++      vendorLinks: [{ vendorId: 'v9' }],
++    });
++    await service.login('admin@example.com', PASSWORD);
++    expect(jwt.signAsync).toHaveBeenCalledWith(
++      expect.objectContaining({ vendorId: 'v9' }),
++    );
++  });
++
++  it('rejects a wrong password', async () => {
++    const { service } = build(baseUser);
++    await expect(service.login('admin@example.com', 'nope')).rejects.toThrow(
++      UnauthorizedException,
++    );
++  });
++
++  it('rejects an unknown email with the same error', async () => {
++    const { service } = build(null);
++    await expect(service.login('x@example.com', PASSWORD)).rejects.toThrow(
++      'Invalid email or password',
++    );
++  });
++
++  it('rejects a disabled user even with the right password', async () => {
++    const { service } = build({ ...baseUser, status: 'DISABLED' });
++    await expect(service.login('admin@example.com', PASSWORD)).rejects.toThrow(
++      UnauthorizedException,
++    );
++  });
++
++  it('me() rejects when the user was disabled after the token was issued', async () => {
++    const { service } = build({ ...baseUser, status: 'DISABLED' });
++    await expect(service.me('u1')).rejects.toThrow(UnauthorizedException);
++  });
++});
+diff --git a/server/src/auth/auth.service.ts b/server/src/auth/auth.service.ts
+new file mode 100644
+index 0000000..4a760f6
+--- /dev/null
++++ b/server/src/auth/auth.service.ts
+@@ -0,0 +1,75 @@
++import { Injectable, UnauthorizedException } from '@nestjs/common';
++import { JwtService } from '@nestjs/jwt';
++import bcrypt from 'bcryptjs';
++import { PrismaService } from '../prisma/prisma.service.js';
++import type { JwtPayload, UserProfile } from './auth.types.js';
++
++// Compared against when the email is unknown, so response time does not
++// reveal whether an account exists.
++const DUMMY_HASH = bcrypt.hashSync('not-a-real-password', 12);
++
++const USER_INCLUDE = {
++  roles: { include: { role: true } },
++  vendorLinks: true,
++} as const;
++
++@Injectable()
++export class AuthService {
++  constructor(
++    private readonly prisma: PrismaService,
++    private readonly jwt: JwtService,
++  ) {}
++
++  async login(email: string, password: string) {
++    const user = await this.prisma.user.findFirst({
++      where: { email: { equals: email.trim(), mode: 'insensitive' } },
++      include: USER_INCLUDE,
++    });
++
++    const passwordOk = await bcrypt.compare(
++      password,
++      user?.passwordHash ?? DUMMY_HASH,
++    );
++    if (!user || !passwordOk || user.status !== 'ACTIVE') {
++      throw new UnauthorizedException('Invalid email or password');
++    }
++
++    await this.prisma.user.update({
++      where: { id: user.id },
++      data: { lastLoginAt: new Date() },
++    });
++
++    const profile = this.toProfile(user);
++    const payload: JwtPayload = {
++      sub: profile.id,
++      roles: profile.roles,
++      vendorId: profile.vendorId,
++    };
++    return { accessToken: await this.jwt.signAsync(payload), user: profile };
++  }
++
++  async me(userId: string): Promise<UserProfile> {
++    const user = await this.prisma.user.findUnique({
++      where: { id: userId },
++      include: USER_INCLUDE,
++    });
++    if (!user || user.status !== 'ACTIVE') throw new UnauthorizedException();
++    return this.toProfile(user);
++  }
++
++  private toProfile(user: {
++    id: string;
++    email: string;
++    fullName: string;
++    roles: { role: { code: string } }[];
++    vendorLinks: { vendorId: string }[];
++  }): UserProfile {
++    return {
++      id: user.id,
++      email: user.email,
++      fullName: user.fullName,
++      roles: user.roles.map((r) => r.role.code),
++      vendorId: user.vendorLinks[0]?.vendorId ?? null,
++    };
++  }
++}
+diff --git a/server/src/auth/auth.types.ts b/server/src/auth/auth.types.ts
+new file mode 100644
+index 0000000..21a67ac
+--- /dev/null
++++ b/server/src/auth/auth.types.ts
+@@ -0,0 +1,20 @@
++import type { Request } from 'express';
++
++/** Claims stored in the access token. Never trust ids sent by the client. */
++export interface JwtPayload {
++  sub: string;
++  roles: string[];
++  vendorId: string | null;
++}
++
++export interface AuthenticatedRequest extends Request {
++  user: JwtPayload;
++}
++
++export interface UserProfile {
++  id: string;
++  email: string;
++  fullName: string;
++  roles: string[];
++  vendorId: string | null;
++}
+diff --git a/server/src/auth/dto/login.dto.ts b/server/src/auth/dto/login.dto.ts
+new file mode 100644
+index 0000000..37a7f8a
+--- /dev/null
++++ b/server/src/auth/dto/login.dto.ts
+@@ -0,0 +1,12 @@
++import { IsEmail, IsNotEmpty, IsString, MaxLength } from 'class-validator';
++
++export class LoginDto {
++  @IsEmail()
++  @MaxLength(254)
++  email: string;
++
++  @IsString()
++  @IsNotEmpty()
++  @MaxLength(128)
++  password: string;
++}
+diff --git a/server/src/auth/jwt-auth.guard.ts b/server/src/auth/jwt-auth.guard.ts
+new file mode 100644
+index 0000000..ccd7fd3
+--- /dev/null
++++ b/server/src/auth/jwt-auth.guard.ts
+@@ -0,0 +1,26 @@
++import {
++  CanActivate,
++  ExecutionContext,
++  Injectable,
++  UnauthorizedException,
++} from '@nestjs/common';
++import { JwtService } from '@nestjs/jwt';
++import type { AuthenticatedRequest, JwtPayload } from './auth.types.js';
++
++@Injectable()
++export class JwtAuthGuard implements CanActivate {
++  constructor(private readonly jwt: JwtService) {}
++
++  async canActivate(context: ExecutionContext): Promise<boolean> {
++    const req = context.switchToHttp().getRequest<AuthenticatedRequest>();
++    const [type, token] = req.headers.authorization?.split(' ') ?? [];
++    if (type !== 'Bearer' || !token) throw new UnauthorizedException();
++
++    try {
++      req.user = await this.jwt.verifyAsync<JwtPayload>(token);
++    } catch {
++      throw new UnauthorizedException();
++    }
++    return true;
++  }
++}
+diff --git a/server/src/main.ts b/server/src/main.ts
+index fa619f7..6167b05 100644
+--- a/server/src/main.ts
++++ b/server/src/main.ts
+@@ -1,23 +1,10 @@
+ import { NestFactory } from '@nestjs/core';
+-import { ValidationPipe } from '@nestjs/common';
+ import { AppModule } from './app.module.js';
++import { configureApp } from './app.setup.js';
+ 
+ async function bootstrap() {
+   const app = await NestFactory.create(AppModule);
+-
+-  app.setGlobalPrefix('api/v1');
+-  app.useGlobalPipes(
+-    new ValidationPipe({
+-      whitelist: true,
+-      forbidNonWhitelisted: true,
+-      transform: true,
+-    }),
+-  );
+-  app.enableCors({
+-    origin: process.env.CLIENT_ORIGIN ?? 'http://localhost:3000',
+-    credentials: true,
+-  });
+-
++  configureApp(app);
+   await app.listen(process.env.PORT ?? 3001);
+ }
+ await bootstrap();
+diff --git a/server/test/app.e2e-spec.ts b/server/test/app.e2e-spec.ts
+index 20193eb..c42640f 100644
+--- a/server/test/app.e2e-spec.ts
++++ b/server/test/app.e2e-spec.ts
+@@ -3,12 +3,14 @@ import { INestApplication } from '@nestjs/common';
+ import request from 'supertest';
+ import { App } from 'supertest/types';
+ import { AppModule } from './../src/app.module.js';
++import { configureApp } from './../src/app.setup.js';
+ import { PrismaService } from './../src/prisma/prisma.service.js';
+ 
+ describe('AppController (e2e)', () => {
+   let app: INestApplication<App>;
+ 
+   beforeEach(async () => {
++    process.env.JWT_SECRET = 'e2e-secret-e2e-secret-e2e-secret-1234';
+     const moduleFixture: TestingModule = await Test.createTestingModule({
+       imports: [AppModule],
+     })
+@@ -21,7 +23,7 @@ describe('AppController (e2e)', () => {
+       .compile();
+ 
+     app = moduleFixture.createNestApplication();
+-    app.setGlobalPrefix('api/v1');
++    configureApp(app);
+     await app.init();
+   });
+ 
+diff --git a/server/test/auth.e2e-spec.ts b/server/test/auth.e2e-spec.ts
+new file mode 100644
+index 0000000..ff299a5
+--- /dev/null
++++ b/server/test/auth.e2e-spec.ts
+@@ -0,0 +1,86 @@
++import { Test } from '@nestjs/testing';
++import { INestApplication } from '@nestjs/common';
++import bcrypt from 'bcryptjs';
++import request from 'supertest';
++import { App } from 'supertest/types';
++import { AppModule } from './../src/app.module.js';
++import { configureApp } from './../src/app.setup.js';
++import { PrismaService } from './../src/prisma/prisma.service.js';
++
++const PASSWORD = 'Correct-Horse-1';
++const user = {
++  id: 'u1',
++  email: 'admin@example.com',
++  fullName: 'Admin',
++  passwordHash: bcrypt.hashSync(PASSWORD, 4),
++  status: 'ACTIVE',
++  roles: [{ role: { code: 'ADMIN' } }],
++  vendorLinks: [],
++};
++
++describe('Auth (e2e)', () => {
++  let app: INestApplication<App>;
++
++  beforeAll(async () => {
++    process.env.JWT_SECRET = 'e2e-secret-e2e-secret-e2e-secret-1234';
++    const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
++      .overrideProvider(PrismaService)
++      .useValue({
++        $connect: async () => undefined,
++        $disconnect: async () => undefined,
++        user: {
++          findFirst: async () => user,
++          findUnique: async () => user,
++          update: async () => user,
++        },
++      })
++      .compile();
++    app = moduleRef.createNestApplication();
++    configureApp(app);
++    await app.init();
++  });
++
++  afterAll(async () => {
++    await app.close();
++  });
++
++  it('POST /auth/login returns a token, then GET /auth/me works with it', async () => {
++    const login = await request(app.getHttpServer())
++      .post('/api/v1/auth/login')
++      .send({ email: user.email, password: PASSWORD })
++      .expect(200);
++
++    const me = await request(app.getHttpServer())
++      .get('/api/v1/auth/me')
++      .set('Authorization', `Bearer ${login.body.accessToken}`)
++      .expect(200);
++    expect(me.body).toMatchObject({ email: user.email, roles: ['ADMIN'] });
++    expect(me.body.passwordHash).toBeUndefined();
++  });
++
++  it('GET /auth/me without a token is 401', () =>
++    request(app.getHttpServer()).get('/api/v1/auth/me').expect(401));
++
++  it('GET /auth/me with a bad token is 401', () =>
++    request(app.getHttpServer())
++      .get('/api/v1/auth/me')
++      .set('Authorization', 'Bearer not.a.token')
++      .expect(401));
++
++  it('POST /auth/login with the wrong password is 401', () =>
++    request(app.getHttpServer())
++      .post('/api/v1/auth/login')
++      .send({ email: user.email, password: 'wrong' })
++      .expect(401));
++
++  it('POST /auth/login rejects unknown fields and bad email (400)', async () => {
++    await request(app.getHttpServer())
++      .post('/api/v1/auth/login')
++      .send({ email: 'not-an-email', password: 'x' })
++      .expect(400);
++    await request(app.getHttpServer())
++      .post('/api/v1/auth/login')
++      .send({ email: user.email, password: PASSWORD, role: 'ADMIN' })
++      .expect(400);
++  });
++});

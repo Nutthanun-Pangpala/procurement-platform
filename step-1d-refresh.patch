@@ -1,0 +1,602 @@
+diff --git a/server/.env.example b/server/.env.example
+index bb60e75..837b224 100644
+--- a/server/.env.example
++++ b/server/.env.example
+@@ -4,3 +4,4 @@ PORT=3001
+ CLIENT_ORIGIN="http://localhost:3000"
+ JWT_SECRET="change-me-to-a-random-string-of-at-least-32-characters"
+ JWT_EXPIRES_IN_SECONDS=900
++REFRESH_TOKEN_DAYS=7
+diff --git a/server/src/auth/auth.controller.ts b/server/src/auth/auth.controller.ts
+index 601b1c5..8a147d4 100644
+--- a/server/src/auth/auth.controller.ts
++++ b/server/src/auth/auth.controller.ts
+@@ -5,21 +5,65 @@ import {
+   HttpCode,
+   Post,
+   Req,
++  Res,
++  UnauthorizedException,
+   UseGuards,
+ } from '@nestjs/common';
++import type { Request, Response } from 'express';
+ import { AuthService } from './auth.service.js';
+ import { LoginDto } from './dto/login.dto.js';
+ import { JwtAuthGuard } from './jwt-auth.guard.js';
++import { readCookie } from './cookies.js';
+ import type { AuthenticatedRequest } from './auth.types.js';
+ 
++const REFRESH_COOKIE = 'refresh_token';
++// Only sent to /auth/* so the refresh token never travels with other requests.
++const COOKIE_PATH = '/api/v1/auth';
++
+ @Controller('auth')
+ export class AuthController {
+   constructor(private readonly auth: AuthService) {}
+ 
+   @Post('login')
+   @HttpCode(200)
+-  login(@Body() dto: LoginDto) {
+-    return this.auth.login(dto.email, dto.password);
++  async login(
++    @Body() dto: LoginDto,
++    @Res({ passthrough: true }) res: Response,
++  ) {
++    const { refreshToken, refreshExpiresAt, ...body } = await this.auth.login(
++      dto.email,
++      dto.password,
++    );
++    this.setRefreshCookie(res, refreshToken, refreshExpiresAt);
++    return body;
++  }
++
++  @Post('refresh')
++  @HttpCode(200)
++  async refresh(
++    @Req() req: Request,
++    @Res({ passthrough: true }) res: Response,
++  ) {
++    const raw = readCookie(req.headers.cookie, REFRESH_COOKIE);
++    if (!raw) throw new UnauthorizedException();
++
++    try {
++      const { refreshToken, refreshExpiresAt, ...body } =
++        await this.auth.refresh(raw);
++      this.setRefreshCookie(res, refreshToken, refreshExpiresAt);
++      return body;
++    } catch (error) {
++      res.clearCookie(REFRESH_COOKIE, { path: COOKIE_PATH });
++      throw error;
++    }
++  }
++
++  @Post('logout')
++  @HttpCode(204)
++  async logout(@Req() req: Request, @Res({ passthrough: true }) res: Response) {
++    const raw = readCookie(req.headers.cookie, REFRESH_COOKIE);
++    if (raw) await this.auth.logout(raw);
++    res.clearCookie(REFRESH_COOKIE, { path: COOKIE_PATH });
+   }
+ 
+   @UseGuards(JwtAuthGuard)
+@@ -27,4 +71,14 @@ export class AuthController {
+   me(@Req() req: AuthenticatedRequest) {
+     return this.auth.me(req.user.sub);
+   }
++
++  private setRefreshCookie(res: Response, token: string, expires: Date) {
++    res.cookie(REFRESH_COOKIE, token, {
++      httpOnly: true,
++      secure: process.env.NODE_ENV === 'production',
++      sameSite: 'lax',
++      path: COOKIE_PATH,
++      expires,
++    });
++  }
+ }
+diff --git a/server/src/auth/auth.service.spec.ts b/server/src/auth/auth.service.spec.ts
+index f63a20b..d4df51d 100644
+--- a/server/src/auth/auth.service.spec.ts
++++ b/server/src/auth/auth.service.spec.ts
+@@ -1,4 +1,5 @@
+ import { UnauthorizedException } from '@nestjs/common';
++import { ConfigService } from '@nestjs/config';
+ import { JwtService } from '@nestjs/jwt';
+ import bcrypt from 'bcryptjs';
+ import { AuthService } from './auth.service.js';
+@@ -14,23 +15,39 @@ const baseUser = {
+   vendorLinks: [],
+ };
+ 
+-function build(user: unknown) {
++function build(user: unknown, tokenRecord: unknown = null) {
+   const prisma = {
+     user: {
+       findFirst: vi.fn().mockResolvedValue(user),
+       findUnique: vi.fn().mockResolvedValue(user),
+       update: vi.fn().mockResolvedValue({}),
+     },
++    refreshToken: {
++      create: vi.fn().mockResolvedValue({}),
++      findUnique: vi.fn().mockResolvedValue(tokenRecord),
++      updateMany: vi.fn().mockResolvedValue({ count: 1 }),
++    },
+   };
+   const jwt = { signAsync: vi.fn().mockResolvedValue('signed-token') };
+   const service = new AuthService(
+     prisma as never,
+     jwt as unknown as JwtService,
++    new ConfigService({}),
+   );
+   return { service, prisma, jwt };
+ }
+ 
+-describe('AuthService', () => {
++const future = () => new Date(Date.now() + 60_000);
++const record = (over: object = {}) => ({
++  id: 't1',
++  userId: 'u1',
++  revokedAt: null,
++  expiresAt: future(),
++  user: baseUser,
++  ...over,
++});
++
++describe('AuthService.login', () => {
+   it('logs in with a valid password and puts roles in the token', async () => {
+     const { service, jwt, prisma } = build(baseUser);
+     const res = await service.login('ADMIN@example.com', PASSWORD);
+@@ -45,6 +62,16 @@ describe('AuthService', () => {
+     expect(prisma.user.update).toHaveBeenCalled();
+   });
+ 
++  it('stores only a hash of the refresh token', async () => {
++    const { service, prisma } = build(baseUser);
++    const res = await service.login('admin@example.com', PASSWORD);
++
++    const stored = prisma.refreshToken.create.mock.calls[0][0].data;
++    expect(stored.tokenHash).toHaveLength(64);
++    expect(stored.tokenHash).not.toBe(res.refreshToken);
++    expect(res.refreshExpiresAt.getTime()).toBeGreaterThan(Date.now());
++  });
++
+   it('puts the vendorId from the vendor link in the token', async () => {
+     const { service, jwt } = build({
+       ...baseUser,
+@@ -77,6 +104,71 @@ describe('AuthService', () => {
+       UnauthorizedException,
+     );
+   });
++});
++
++describe('AuthService.refresh', () => {
++  it('rotates: revokes the old token and issues a new pair', async () => {
++    const { service, prisma } = build(baseUser, record());
++    const res = await service.refresh('raw-token');
++
++    expect(res.accessToken).toBe('signed-token');
++    expect(prisma.refreshToken.updateMany).toHaveBeenCalledWith(
++      expect.objectContaining({ where: { id: 't1', revokedAt: null } }),
++    );
++    expect(prisma.refreshToken.create).toHaveBeenCalledTimes(1);
++  });
++
++  it('rejects an unknown token', async () => {
++    const { service } = build(baseUser, null);
++    await expect(service.refresh('x')).rejects.toThrow(UnauthorizedException);
++  });
++
++  it('on reuse of a revoked token, revokes every session of that user', async () => {
++    const { service, prisma } = build(
++      baseUser,
++      record({ revokedAt: new Date() }),
++    );
++    await expect(service.refresh('x')).rejects.toThrow(UnauthorizedException);
++    expect(prisma.refreshToken.updateMany).toHaveBeenCalledWith(
++      expect.objectContaining({ where: { userId: 'u1', revokedAt: null } }),
++    );
++    expect(prisma.refreshToken.create).not.toHaveBeenCalled();
++  });
++
++  it('rejects an expired token', async () => {
++    const { service } = build(
++      baseUser,
++      record({ expiresAt: new Date(Date.now() - 1000) }),
++    );
++    await expect(service.refresh('x')).rejects.toThrow(UnauthorizedException);
++  });
++
++  it('rejects when the user was disabled', async () => {
++    const { service } = build(
++      baseUser,
++      record({ user: { ...baseUser, status: 'DISABLED' } }),
++    );
++    await expect(service.refresh('x')).rejects.toThrow(UnauthorizedException);
++  });
++
++  it('rejects when another request already claimed the token', async () => {
++    const { service, prisma } = build(baseUser, record());
++    prisma.refreshToken.updateMany.mockResolvedValue({ count: 0 });
++    await expect(service.refresh('x')).rejects.toThrow(UnauthorizedException);
++    expect(prisma.refreshToken.create).not.toHaveBeenCalled();
++  });
++});
++
++describe('AuthService.logout / me', () => {
++  it('logout revokes the matching token', async () => {
++    const { service, prisma } = build(baseUser);
++    await service.logout('raw');
++    expect(prisma.refreshToken.updateMany).toHaveBeenCalledWith(
++      expect.objectContaining({
++        data: { revokedAt: expect.any(Date) },
++      }),
++    );
++  });
+ 
+   it('me() rejects when the user was disabled after the token was issued', async () => {
+     const { service } = build({ ...baseUser, status: 'DISABLED' });
+diff --git a/server/src/auth/auth.service.ts b/server/src/auth/auth.service.ts
+index 4a760f6..42157a8 100644
+--- a/server/src/auth/auth.service.ts
++++ b/server/src/auth/auth.service.ts
+@@ -1,6 +1,8 @@
+ import { Injectable, UnauthorizedException } from '@nestjs/common';
++import { ConfigService } from '@nestjs/config';
+ import { JwtService } from '@nestjs/jwt';
+ import bcrypt from 'bcryptjs';
++import { createHash, randomBytes } from 'node:crypto';
+ import { PrismaService } from '../prisma/prisma.service.js';
+ import type { JwtPayload, UserProfile } from './auth.types.js';
+ 
+@@ -13,12 +15,30 @@ const USER_INCLUDE = {
+   vendorLinks: true,
+ } as const;
+ 
++type UserWithRelations = {
++  id: string;
++  email: string;
++  fullName: string;
++  status: string;
++  roles: { role: { code: string } }[];
++  vendorLinks: { vendorId: string }[];
++};
++
++// Only the hash is stored, so a database leak does not leak usable tokens.
++const hashToken = (token: string) =>
++  createHash('sha256').update(token).digest('hex');
++
+ @Injectable()
+ export class AuthService {
++  private readonly refreshDays: number;
++
+   constructor(
+     private readonly prisma: PrismaService,
+     private readonly jwt: JwtService,
+-  ) {}
++    config: ConfigService,
++  ) {
++    this.refreshDays = Number(config.get('REFRESH_TOKEN_DAYS') ?? 7);
++  }
+ 
+   async login(email: string, password: string) {
+     const user = await this.prisma.user.findFirst({
+@@ -38,14 +58,45 @@ export class AuthService {
+       where: { id: user.id },
+       data: { lastLoginAt: new Date() },
+     });
++    return this.startSession(user);
++  }
+ 
+-    const profile = this.toProfile(user);
+-    const payload: JwtPayload = {
+-      sub: profile.id,
+-      roles: profile.roles,
+-      vendorId: profile.vendorId,
+-    };
+-    return { accessToken: await this.jwt.signAsync(payload), user: profile };
++  /** Rotates the refresh token: the old one is revoked, a new one is issued. */
++  async refresh(rawToken: string) {
++    const record = await this.prisma.refreshToken.findUnique({
++      where: { tokenHash: hashToken(rawToken) },
++      include: { user: { include: USER_INCLUDE } },
++    });
++    if (!record) throw new UnauthorizedException();
++
++    if (record.revokedAt) {
++      // A revoked token came back: treat it as stolen and end every session.
++      await this.prisma.refreshToken.updateMany({
++        where: { userId: record.userId, revokedAt: null },
++        data: { revokedAt: new Date() },
++      });
++      throw new UnauthorizedException();
++    }
++    if (record.expiresAt <= new Date() || record.user.status !== 'ACTIVE') {
++      throw new UnauthorizedException();
++    }
++
++    // Only one concurrent request can claim the token.
++    const claimed = await this.prisma.refreshToken.updateMany({
++      where: { id: record.id, revokedAt: null },
++      data: { revokedAt: new Date() },
++    });
++    if (claimed.count === 0) throw new UnauthorizedException();
++
++    return this.startSession(record.user);
++  }
++
++  /** Idempotent: unknown or already revoked tokens are ignored. */
++  async logout(rawToken: string) {
++    await this.prisma.refreshToken.updateMany({
++      where: { tokenHash: hashToken(rawToken), revokedAt: null },
++      data: { revokedAt: new Date() },
++    });
+   }
+ 
+   async me(userId: string): Promise<UserProfile> {
+@@ -57,13 +108,33 @@ export class AuthService {
+     return this.toProfile(user);
+   }
+ 
+-  private toProfile(user: {
+-    id: string;
+-    email: string;
+-    fullName: string;
+-    roles: { role: { code: string } }[];
+-    vendorLinks: { vendorId: string }[];
+-  }): UserProfile {
++  private async startSession(user: UserWithRelations) {
++    const profile = this.toProfile(user);
++    const payload: JwtPayload = {
++      sub: profile.id,
++      roles: profile.roles,
++      vendorId: profile.vendorId,
++    };
++    const refreshToken = randomBytes(48).toString('base64url');
++    const refreshExpiresAt = new Date(
++      Date.now() + this.refreshDays * 24 * 60 * 60 * 1000,
++    );
++    await this.prisma.refreshToken.create({
++      data: {
++        userId: profile.id,
++        tokenHash: hashToken(refreshToken),
++        expiresAt: refreshExpiresAt,
++      },
++    });
++    return {
++      accessToken: await this.jwt.signAsync(payload),
++      user: profile,
++      refreshToken,
++      refreshExpiresAt,
++    };
++  }
++
++  private toProfile(user: UserWithRelations): UserProfile {
+     return {
+       id: user.id,
+       email: user.email,
+diff --git a/server/src/auth/cookies.ts b/server/src/auth/cookies.ts
+new file mode 100644
+index 0000000..469115e
+--- /dev/null
++++ b/server/src/auth/cookies.ts
+@@ -0,0 +1,18 @@
++/** Minimal Cookie header reader (avoids adding cookie-parser). */
++export function readCookie(
++  header: string | undefined,
++  name: string,
++): string | undefined {
++  if (!header) return undefined;
++  for (const part of header.split(';')) {
++    const [key, ...rest] = part.trim().split('=');
++    if (key === name) {
++      try {
++        return decodeURIComponent(rest.join('='));
++      } catch {
++        return undefined;
++      }
++    }
++  }
++  return undefined;
++}
+diff --git a/server/test/auth.e2e-spec.ts b/server/test/auth.e2e-spec.ts
+index ff299a5..badc040 100644
+--- a/server/test/auth.e2e-spec.ts
++++ b/server/test/auth.e2e-spec.ts
+@@ -18,39 +18,91 @@ const user = {
+   vendorLinks: [],
+ };
+ 
++type TokenRow = {
++  id: string;
++  userId: string;
++  tokenHash: string;
++  expiresAt: Date;
++  revokedAt: Date | null;
++};
++
++// Small in-memory stand-in for the RefreshToken table.
++function fakePrisma() {
++  const tokens: TokenRow[] = [];
++  return {
++    $connect: async () => undefined,
++    $disconnect: async () => undefined,
++    user: {
++      findFirst: async () => user,
++      findUnique: async () => user,
++      update: async () => user,
++    },
++    refreshToken: {
++      create: async ({
++        data,
++      }: {
++        data: Omit<TokenRow, 'id' | 'revokedAt'>;
++      }) => {
++        const row = { ...data, id: `t${tokens.length + 1}`, revokedAt: null };
++        tokens.push(row);
++        return row;
++      },
++      findUnique: async ({ where }: { where: { tokenHash: string } }) => {
++        const row = tokens.find((t) => t.tokenHash === where.tokenHash);
++        return row ? { ...row, user } : null;
++      },
++      updateMany: async ({
++        where,
++        data,
++      }: {
++        where: Partial<TokenRow>;
++        data: { revokedAt: Date };
++      }) => {
++        const rows = tokens.filter(
++          (t) =>
++            (where.id === undefined || t.id === where.id) &&
++            (where.userId === undefined || t.userId === where.userId) &&
++            (where.tokenHash === undefined ||
++              t.tokenHash === where.tokenHash) &&
++            t.revokedAt === null,
++        );
++        rows.forEach((t) => (t.revokedAt = data.revokedAt));
++        return { count: rows.length };
++      },
++    },
++  };
++}
++
++const cookieOf = (res: request.Response) =>
++  (res.headers['set-cookie'] as unknown as string[])[0].split(';')[0];
++
+ describe('Auth (e2e)', () => {
+   let app: INestApplication<App>;
++  const http = () => request(app.getHttpServer());
+ 
+-  beforeAll(async () => {
++  beforeEach(async () => {
+     process.env.JWT_SECRET = 'e2e-secret-e2e-secret-e2e-secret-1234';
+     const moduleRef = await Test.createTestingModule({ imports: [AppModule] })
+       .overrideProvider(PrismaService)
+-      .useValue({
+-        $connect: async () => undefined,
+-        $disconnect: async () => undefined,
+-        user: {
+-          findFirst: async () => user,
+-          findUnique: async () => user,
+-          update: async () => user,
+-        },
+-      })
++      .useValue(fakePrisma())
+       .compile();
+     app = moduleRef.createNestApplication();
+     configureApp(app);
+     await app.init();
+   });
+ 
+-  afterAll(async () => {
++  afterEach(async () => {
+     await app.close();
+   });
+ 
+-  it('POST /auth/login returns a token, then GET /auth/me works with it', async () => {
+-    const login = await request(app.getHttpServer())
++  it('login returns a token, then /auth/me works with it', async () => {
++    const login = await http()
+       .post('/api/v1/auth/login')
+       .send({ email: user.email, password: PASSWORD })
+       .expect(200);
++    expect(login.body.refreshToken).toBeUndefined();
+ 
+-    const me = await request(app.getHttpServer())
++    const me = await http()
+       .get('/api/v1/auth/me')
+       .set('Authorization', `Bearer ${login.body.accessToken}`)
+       .expect(200);
+@@ -58,27 +110,81 @@ describe('Auth (e2e)', () => {
+     expect(me.body.passwordHash).toBeUndefined();
+   });
+ 
+-  it('GET /auth/me without a token is 401', () =>
+-    request(app.getHttpServer()).get('/api/v1/auth/me').expect(401));
++  it('login sets an httpOnly refresh cookie limited to /api/v1/auth', async () => {
++    const login = await http()
++      .post('/api/v1/auth/login')
++      .send({ email: user.email, password: PASSWORD })
++      .expect(200);
++    const header = (login.headers['set-cookie'] as unknown as string[])[0];
++    expect(header).toContain('refresh_token=');
++    expect(header).toContain('HttpOnly');
++    expect(header).toContain('Path=/api/v1/auth');
++  });
++
++  it('refresh rotates the cookie, and the old one stops working', async () => {
++    const login = await http()
++      .post('/api/v1/auth/login')
++      .send({ email: user.email, password: PASSWORD })
++      .expect(200);
++    const first = cookieOf(login);
++
++    const refreshed = await http()
++      .post('/api/v1/auth/refresh')
++      .set('Cookie', first)
++      .expect(200);
++    expect(refreshed.body.accessToken).toBeDefined();
++    const second = cookieOf(refreshed);
++    expect(second).not.toBe(first);
+ 
+-  it('GET /auth/me with a bad token is 401', () =>
+-    request(app.getHttpServer())
++    // Replaying the old token is rejected and kills the new session too.
++    await http().post('/api/v1/auth/refresh').set('Cookie', first).expect(401);
++    await http().post('/api/v1/auth/refresh').set('Cookie', second).expect(401);
++  });
++
++  it('refresh without a cookie is 401', () =>
++    http().post('/api/v1/auth/refresh').expect(401));
++
++  it('logout revokes the refresh token and clears the cookie', async () => {
++    const login = await http()
++      .post('/api/v1/auth/login')
++      .send({ email: user.email, password: PASSWORD })
++      .expect(200);
++    const cookie = cookieOf(login);
++
++    const out = await http()
++      .post('/api/v1/auth/logout')
++      .set('Cookie', cookie)
++      .expect(204);
++    expect((out.headers['set-cookie'] as unknown as string[])[0]).toContain(
++      'refresh_token=;',
++    );
++
++    await http().post('/api/v1/auth/refresh').set('Cookie', cookie).expect(401);
++  });
++
++  it('logout without a cookie is still 204', () =>
++    http().post('/api/v1/auth/logout').expect(204));
++
++  it('/auth/me without or with a bad token is 401', async () => {
++    await http().get('/api/v1/auth/me').expect(401);
++    await http()
+       .get('/api/v1/auth/me')
+       .set('Authorization', 'Bearer not.a.token')
+-      .expect(401));
++      .expect(401);
++  });
+ 
+-  it('POST /auth/login with the wrong password is 401', () =>
+-    request(app.getHttpServer())
++  it('login with the wrong password is 401', () =>
++    http()
+       .post('/api/v1/auth/login')
+       .send({ email: user.email, password: 'wrong' })
+       .expect(401));
+ 
+-  it('POST /auth/login rejects unknown fields and bad email (400)', async () => {
+-    await request(app.getHttpServer())
++  it('login rejects bad email and unknown fields (400)', async () => {
++    await http()
+       .post('/api/v1/auth/login')
+       .send({ email: 'not-an-email', password: 'x' })
+       .expect(400);
+-    await request(app.getHttpServer())
++    await http()
+       .post('/api/v1/auth/login')
+       .send({ email: user.email, password: PASSWORD, role: 'ADMIN' })
+       .expect(400);
